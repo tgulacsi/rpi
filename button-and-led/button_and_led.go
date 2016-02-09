@@ -23,7 +23,7 @@ func main() {
 	for {
 		act := button.Read()
 		if act == old {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		if act == rpio.High {
