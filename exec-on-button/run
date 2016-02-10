@@ -1,0 +1,5 @@
+#!/bin/sh
+export HOME=/home/pi
+exec chpst -b scanbutton -u pi:scanner:gpio \
+	/home/pi/bin/exec-on-button /home/pi/bin/scn.sh \
+	2>&1
