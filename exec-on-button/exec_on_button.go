@@ -28,10 +28,14 @@
 package main
 
 import (
+	"flag"
 	"log"
+	"math/rand"
+	"os/exec"
 	"time"
 
 	"github.com/stianeikeland/go-rpio"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -42,6 +46,12 @@ const (
 	MinPress   = 500 * time.Millisecond
 )
 
+var (
+	IdleTimes       = times{On: 500 * time.Millisecond, Off: time.Second}
+	InProgressTimes = times{On: time.Second, Off: 500 * time.Millisecond}
+	ErrorTimes      = times{On: -500 * time.Millisecond, Off: -500 * time.Millisecond}
+)
+
 type ButtonEvent uint8
 
 const (
@@ -50,70 +60,119 @@ const (
 )
 
 func main() {
+	flagButtonPin := flag.Int("button", 25, "button pin")
+	flagLEDPin := flag.Int("led", 24, "LED pin")
+	flag.Parse()
+
 	if err := rpio.Open(); err != nil {
 		log.Fatal(err)
 	}
 	defer rpio.Close()
 
-	button := rpio.Pin(25)
+	button := rpio.Pin(*flagButtonPin)
 	button.Input()
 
-	led := rpio.Pin(24)
+	led := rpio.Pin(*flagLEDPin)
 	led.Output()
 
-	getEvents(button)
-
-	ledCh := make(chan time.Duration)
-	go func() {
-		dCh := make(chan time.Duration)
-		go func() {
-			state := rpio.Low
-			d := time.Second
-			for {
-				select {
-				case d = <-dCh:
-				case <-time.After(d):
-				}
-				state = rpio.State((state + 1) % 2)
-				led.Write(state)
-			}
-		}()
-		led.Write(rpio.Low)
-		for d := range ledCh {
-			if d < 0 {
-				led.Write(rpio.Low)
-				continue
-			}
-			led.Write(rpio.High)
-			if d == 0 {
-				continue
-			}
-			dCh <- d
-		}
-	}()
+	ledCh := make(chan times, 1)
 	defer close(ledCh)
+	ledCh <- IdleTimes
+	go blink(led, ledCh)
 
-	inCh := make(chan rpio.State)
-	go func() {
-		old := button.Read()
-		inCh <- old
-		for {
-			act := button.Read()
-			if act != old {
-				old = act
-				inCh <- act
+	errCh := make(chan error, 1)
+	var ctx context.Context
+	var cancel func()
+	events := getEvents(button)
+	for {
+		select {
+		case event := <-events:
+			switch event {
+			case StopEvent:
+				if cancel == nil { // nothing in progress
+					continue
+				}
+				cancel()
+				cancel = nil
+				ledCh <- IdleTimes
+			case StartEvent:
+				if cancel != nil { // action in progress
+					continue
+				}
+				ctx, cancel = context.WithCancel(context.Background())
+				go run(ctx, errCh, exec.Command(flag.Args()[0], flag.Args()[1:]...))
+				select {
+				case err := <-errCh:
+					log.Printf("error starting %v: %v", flag.Args(), err)
+					ledCh <- ErrorTimes
+				default:
+					ledCh <- InProgressTimes
+				}
 			}
-			time.Sleep(100 * time.Millisecond)
+		case err := <-errCh:
+			cancel()
+			cancel = nil
+			if err == nil {
+				log.Printf("Command successfully finished.")
+				ledCh <- IdleTimes
+			} else {
+				log.Printf("ERROR running %v: %v", flag.Args(), err)
+				ledCh <- ErrorTimes
+			}
 		}
-	}()
+	}
+}
 
-	ledCh <- time.Second
-	for state := range inCh {
-		if state == rpio.High {
-			ledCh <- time.Duration(333 * time.Millisecond)
-		} else {
-			ledCh <- time.Duration(1 * time.Second)
+func blink(led rpio.Pin, dCh <-chan times) {
+	state := rpio.Low
+	led.Write(state)
+	d := IdleTimes
+	for {
+		select {
+		case d = <-dCh:
+		case <-time.After(d.Duration(state == rpio.High)):
 		}
+		state = rpio.State((state + 1) % 2)
+		led.Write(state)
+	}
+}
+
+type times struct {
+	On, Off time.Duration
+}
+
+func (t times) Duration(on bool) time.Duration {
+	d := t.On
+	if !on {
+		d = t.Off
+	}
+	if d < 0 {
+		d = time.Duration(float32(d) * (0.5 + rand.Float32()/2))
+	}
+	return d
+}
+
+// run the given command, within the given context.
+// On cancel, kill the children.
+func run(ctx context.Context, errCh chan<- error, cmd *exec.Cmd) {
+	select {
+	case <-ctx.Done():
+		errCh <- ctx.Err()
+		return
+	default:
+	}
+	if err := cmd.Start(); err != nil {
+		errCh <- err
+		return
+	}
+	finish := make(chan error, 1)
+	go func() { finish <- cmd.Wait() }()
+	select {
+	case <-ctx.Done():
+		cmd.Process.Kill()
+		errCh <- ctx.Err()
+	case err := <-finish:
+		errCh <- err
 	}
 }
 
