@@ -31,6 +31,8 @@ import (
 	"flag"
 	"log"
 	"math/rand"
+	"net/http"
+	"os"
 	"os/exec"
 	"time"
 
@@ -43,13 +45,13 @@ const (
 
 	LongPress  = 5 * time.Second
 	ShortPress = 2 * time.Second
-	MinPress   = 500 * time.Millisecond
+	MinPress   = 100 * time.Millisecond
 )
 
 var (
-	IdleTimes       = times{On: 500 * time.Millisecond, Off: time.Second}
-	InProgressTimes = times{On: time.Second, Off: 500 * time.Millisecond}
-	ErrorTimes      = times{On: -500 * time.Millisecond, Off: -500 * time.Millisecond}
+	IdleTimes       = times{On: 100 * time.Millisecond, Off: 2 * time.Second}
+	InProgressTimes = times{On: 750 * time.Millisecond, Off: 500 * time.Millisecond}
+	ErrorTimes      = times{On: 100 * time.Millisecond, Off: 150 * time.Millisecond}
 )
 
 type ButtonEvent uint8
@@ -59,15 +61,22 @@ const (
 	StopEvent
 )
 
+var debug = func(pattern string, args ...interface{}) {}
+
 func main() {
 	flagButtonPin := flag.Int("button", 25, "button pin")
 	flagLEDPin := flag.Int("led", 24, "LED pin")
+	flagHTTP := flag.String("http", "0.0.0.0:1234", "HTTP listen address")
+	flagVerbose := flag.Bool("v", false, "verbose logging")
 	flag.Parse()
 
 	if err := rpio.Open(); err != nil {
 		log.Fatal(err)
 	}
 	defer rpio.Close()
+	if *flagVerbose {
+		debug = log.Printf
+	}
 
 	button := rpio.Pin(*flagButtonPin)
 	button.Input()
@@ -83,24 +92,39 @@ func main() {
 	errCh := make(chan error, 1)
 	var ctx context.Context
 	var cancel func()
-	events := getEvents(button)
+	events := make(chan ButtonEvent, 1)
+	if *flagHTTP != "" {
+		http.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) { events <- StartEvent })
+		http.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) { events <- StopEvent })
+		log.Printf("Start listening on %q...", *flagHTTP)
+		go http.ListenAndServe(*flagHTTP, nil)
+	} else {
+		log.Println("Started.")
+	}
+	go getEvents(events, button)
 	for {
 		select {
 		case event := <-events:
 			switch event {
 			case StopEvent:
 				if cancel == nil { // nothing in progress
+					log.Printf("received STOP, but nothing is in progress")
+					ledCh <- IdleTimes
 					continue
 				}
+				log.Printf("STOPping...")
 				cancel()
 				cancel = nil
 				ledCh <- IdleTimes
 			case StartEvent:
 				if cancel != nil { // action in progress
+					log.Printf("received START, but already running!")
 					continue
 				}
+				ledCh <- InProgressTimes
 				ctx, cancel = context.WithCancel(context.Background())
 				go run(ctx, errCh, exec.Command(flag.Args()[0], flag.Args()[1:]...))
+				log.Printf("STARTing %v", flag.Args())
 				select {
 				case err := <-errCh:
 					log.Printf("error starting %v: %v", flag.Args(), err)
@@ -110,7 +134,9 @@ func main() {
 				}
 			}
 		case err := <-errCh:
-			cancel()
+			if cancel != nil {
+				cancel()
+			}
 			cancel = nil
 			if err == nil {
 				log.Printf("Command successfully finished.")
@@ -126,6 +152,7 @@ func main() {
 func blink(led rpio.Pin, dCh <-chan times) {
 	state := rpio.Low
 	led.Write(state)
+	defer led.Write(rpio.Low)
 	d := IdleTimes
 	for {
 		select {
@@ -147,8 +174,9 @@ func (t times) Duration(on bool) time.Duration {
 		d = t.Off
 	}
 	if d < 0 {
-		d = time.Duration(float32(d) * (0.5 + rand.Float32()/2))
+		d = time.Duration(float32(-d) * (0.5 + rand.Float32()/2))
 	}
+	//debug("duration(%t)=%s", on, d)
 	return d
 }
 
@@ -161,6 +189,8 @@ func run(ctx context.Context, errCh chan<- error, cmd *exec.Cmd) {
 		return
 	default:
 	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		errCh <- err
 		return
@@ -176,23 +206,25 @@ func run(ctx context.Context, errCh chan<- error, cmd *exec.Cmd) {
 	}
 }
 
-// getEvents returns a channel which gives the events from the button presses.
-func getEvents(button rpio.Pin) <-chan ButtonEvent {
+// getEventsCh returns a channel which gives the events from the button presses.
+func getEventsCh(button rpio.Pin) <-chan ButtonEvent {
 	buttonCh := make(chan ButtonEvent)
-	go func() {
-		for press := range getButtonPresses(button) {
-			if press < MinPress {
-				continue
-			}
-			if press > LongPress {
-				buttonCh <- StopEvent
-			}
-			if press < ShortPress {
-				buttonCh <- StartEvent
-			}
-		}
-	}()
+	go getEvents(buttonCh, button)
 	return buttonCh
+}
+
+func getEvents(buttonCh chan<- ButtonEvent, button rpio.Pin) {
+	for press := range getButtonPresses(button) {
+		if press < MinPress {
+			continue
+		}
+		if press > LongPress {
+			buttonCh <- StopEvent
+		}
+		if press < ShortPress {
+			buttonCh <- StartEvent
+		}
+	}
 }
 
 // getButtonPresses returns a channel which gives the button hold durations.
@@ -206,6 +238,10 @@ func getButtonPresses(button rpio.Pin) <-chan time.Duration {
 		}
 		for now := range time.NewTicker(eventLoopDuration).C {
 			act := button.Read() == rpio.High
+			if down == act {
+				continue
+			}
+			debug("old=%t act=%t", down, act)
 			if down && !act {
 				ch <- time.Since(start)
 			} else if !down && act {
