@@ -1,4 +1,8 @@
 #!/bin/sh
+if [ ! -d /var/log/scn-sane-pp ]; then
+	mkdir -p /var/log/scn-sane-pp
+	chown pi /var/log/scn-sane-pp
+fi
 export HOME=/home/pi
 exec chpst -b scanbutton -u pi:scanner:gpio \
 	/home/pi/bin/exec-on-button /home/pi/bin/scn.sh \
