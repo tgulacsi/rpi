@@ -1,51 +1,139 @@
 package main
 
 import (
-	"flag"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 	"time"
 
+	"gopkg.in/errgo.v1"
+
 	"github.com/eclipse/paho.mqtt.golang"
+	"github.com/spf13/cobra"
 )
+
+var ErrTimeout = errgo.Newf("timeout")
 
 // http://www.eclipse.org/paho/clients/golang/
 
 func main() {
-	flagServer := flag.String("server", "tcp://192.168.1.3:1883", "server address")
-	flagStore := flag.String("store", "mqtt-store", "path for mqtt store")
-	flagQoS := flag.Int("qos", 1, "quality-of-service")
-	flagTopic := flag.String("topic", "#", "topic")
-	flagTimeout := flag.Duration("timeout", 5*time.Second, "timeout for connection/publish")
-	flag.Parse()
+	server := "tcp://192.168.1.3:1883"
+	topic := "topic"
+	timeout := 5 * time.Second
+	clientID, _ := os.Hostname()
+	mainCmd := &cobra.Command{
+		Use: "mqttc",
+	}
+	p := mainCmd.PersistentFlags()
+	p.StringVarP(&server, "server", "S", server, "server address")
+	p.DurationVarP(&timeout, "timeout", "", timeout, "timeout for commands")
+	p.StringVarP(&clientID, "id", "", clientID, "client ID")
 
+	store := "mqtt-store"
+	qos := 1
+	pubCmd := &cobra.Command{
+		Use:     "pub",
+		Aliases: []string{"publish", "send", "write"},
+		Run: func(_ *cobra.Command, args []string) {
+			client, err := newClient(server, clientID, store, timeout)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer client.Disconnect(uint(time.Second / time.Millisecond))
+
+			for _, arg := range args {
+				var r io.ReadCloser
+				if strings.HasPrefix(arg, "@") {
+					arg = arg[1:]
+					if arg == "-" {
+						r = os.Stdin
+					} else if fh, err := os.Open(arg); err != nil {
+						log.Fatal(err)
+					} else {
+						r = fh
+					}
+				} else {
+					r = ioutil.NopCloser(strings.NewReader(arg))
+				}
+				b, err := ioutil.ReadAll(&io.LimitedReader{R: r, N: 256 << 20})
+				r.Close()
+				if err != nil {
+					log.Fatal(err)
+				}
+				pt := client.Publish(topic, uint8(qos), true, b)
+				if !pt.WaitTimeout(timeout) || pt.Error() != nil {
+					if err := pt.Error(); err != nil {
+						log.Fatal(err)
+					}
+					log.Fatalf("publish timeout")
+				}
+				log.Printf("Sent %q: %q", arg, pt.(*mqtt.PublishToken).MessageID())
+			}
+		},
+	}
+	f := pubCmd.Flags()
+	p.StringVarP(&topic, "topic", "t", topic, "topic to publish")
+	f.StringVarP(&store, "store", "", store, "path for mqtt store")
+	f.IntVarP(&qos, "qos", "q", qos, "Quality of Service (0, 1 or 2)")
+
+	subCmd := &cobra.Command{
+		Use:     "sub",
+		Aliases: []string{"subscribe", "recv", "receive", "read"},
+		Run: func(_ *cobra.Command, args []string) {
+			if len(args) > 0 {
+				topic = args[0]
+			}
+			client, err := newClient(server, clientID, store, timeout)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer client.Disconnect(uint(time.Second / time.Millisecond))
+
+			if st := client.Subscribe(topic, uint8(qos), msgHandler); !st.WaitTimeout(timeout) || st.Error() != nil {
+				if err := st.Error(); err != nil {
+					log.Fatal(err)
+				}
+				log.Fatal(errgo.WithCausef(nil, ErrTimeout, "subscribe"))
+			}
+			time.Sleep(3 * time.Second)
+		},
+	}
+
+	mainCmd.AddCommand(pubCmd, subCmd)
+	mainCmd.Execute()
+}
+
+var msgHandler = mqtt.MessageHandler(func(client *mqtt.Client, msg mqtt.Message) {
+	log.Printf("got message from %q (%v): %q", msg.Topic(), msg.MessageID(), msg.Payload())
+})
+
+func newClient(server, clientID, store string, timeout time.Duration) (*mqtt.Client, error) {
 	opts := mqtt.NewClientOptions().
-		AddBroker(*flagServer).
+		AddBroker(server).
 		SetAutoReconnect(true).
 		SetKeepAlive(2 * time.Second).
 		SetPingTimeout(1 * time.Second).
 		SetMaxReconnectInterval(1 * time.Minute).
 		SetOrderMatters(false)
-	if hn, err := os.Hostname(); err == nil {
-		opts.SetClientID(hn)
+	if clientID == "" {
+		if hn, err := os.Hostname(); err == nil {
+			clientID = hn
+		}
 	}
-	if *flagStore != "" {
-		opts.SetStore(mqtt.NewFileStore(*flagStore))
+	if clientID != "" {
+		opts.SetClientID(clientID)
+	}
+	if store != "" {
+		opts.SetStore(mqtt.NewFileStore(store))
 	}
 	client := mqtt.NewClient(opts)
-	if ct := client.Connect(); !ct.WaitTimeout(*flagTimeout) || ct.Error() != nil {
+	if ct := client.Connect(); !ct.WaitTimeout(timeout) || ct.Error() != nil {
 		if err := ct.Error(); err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
-		log.Fatalf("timeout connection")
+		return nil, errgo.WithCausef(nil, ErrTimeout, "connection")
 	}
-	defer client.Disconnect(uint(time.Second / time.Millisecond))
-
-	pt := client.Publish(*flagTopic, uint8(*flagQoS), true, []byte("aa"))
-	if !pt.WaitTimeout(*flagTimeout) || pt.Error() != nil {
-		if err := pt.Error(); err != nil {
-			log.Fatal(err)
-		}
-		log.Fatalf("publish timeout")
-	}
+	return client, nil
 }
