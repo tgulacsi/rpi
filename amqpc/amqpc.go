@@ -16,12 +16,19 @@
 package main
 
 import (
+	"compress/gzip"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"mime"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"camlistore.org/pkg/magic"
 
 	"gopkg.in/errgo.v1"
 	"gopkg.in/mqtt.v0"
@@ -47,6 +54,7 @@ func main() {
 	p.StringVarP(&clientID, "id", "", clientID, "client ID")
 	p.StringVarP(&queue, "queue", "q", queue, "queue name to publish")
 
+	appID := queue
 	pubCmd := &cobra.Command{
 		Use:     "pub",
 		Aliases: []string{"publish", "send", "write"},
@@ -59,12 +67,17 @@ func main() {
 			if err = c.Confirm(false); err != nil {
 				log.Fatal(err)
 			}
-			confirms := c.NotifyPublish(make(chan amqp.Confirmation))
-			returns := c.NotifyReturn(make(chan amqp.Return))
+			confirms := c.NotifyPublish(make(chan amqp.Confirmation, 1))
+			returns := c.NotifyReturn(make(chan amqp.Return, 1))
 
 			var sendCount int
+			tbl := make(map[string]interface{}, 1)
 			for _, arg := range args {
+				for k := range tbl {
+					delete(tbl, k)
+				}
 				var r io.ReadCloser
+				mimeType, contentEncoding := "text/plain", ""
 				if strings.HasPrefix(arg, "@") {
 					arg = arg[1:]
 					if arg == "-" {
@@ -72,7 +85,23 @@ func main() {
 					} else if fh, err := os.Open(arg); err != nil {
 						log.Fatal(err)
 					} else {
-						r = fh
+						pr, pw := io.Pipe()
+						go func() {
+							defer fh.Close()
+							gw := gzip.NewWriter(pw)
+							if _, err := io.Copy(gw, fh); err != nil {
+								pw.CloseWithError(err)
+								return
+							}
+							pw.CloseWithError(gw.Close())
+						}()
+						r = pr
+						tbl["FileName"] = arg
+						if err := amqp.Table(tbl).Validate(); err != nil {
+							log.Fatal(err)
+						}
+						contentEncoding = "application/gzip"
+						mimeType = mime.TypeByExtension(filepath.Ext(arg))
 					}
 				} else {
 					r = ioutil.NopCloser(strings.NewReader(arg))
@@ -82,11 +111,19 @@ func main() {
 				if err != nil {
 					log.Fatal(err)
 				}
+				if mimeType == "" {
+					if mimeType = magic.MIMEType(b); mimeType == "" {
+						mimeType = "application/octet-stream"
+					}
+				}
 				if err := c.Publish("", c.Queue.Name, false, false,
 					amqp.Publishing{
-						DeliveryMode: amqp.Persistent,
-						ContentType:  "text/plain",
-						Body:         b,
+						Headers:         tbl,
+						DeliveryMode:    amqp.Persistent,
+						ContentType:     mimeType,
+						ContentEncoding: contentEncoding,
+						AppId:           appID,
+						Body:            b,
 					},
 				); err != nil {
 					log.Fatalf("Publish: %v", err)
@@ -113,10 +150,13 @@ func main() {
 						break Loop
 					}
 					log.Printf("RETURN: %#v", r)
+					i++
 				}
 			}
 		},
 	}
+	f := pubCmd.Flags()
+	f.StringVarP(&appID, "app-id", "", appID, "appID")
 
 	subCmd := &cobra.Command{
 		Use:     "sub",
@@ -132,8 +172,44 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
+			tempDir, err := ioutil.TempDir("", "amqpc-")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer os.RemoveAll(tempDir)
+			var i uint64
 			for msg := range d {
-				log.Printf("Received %#v", msg)
+				i++
+				log.Printf("Received %s with %q from %s@%s.",
+					msg.MessageId, msg.Headers, msg.UserId, msg.AppId)
+				fn := msg.Headers["FileName"].(string)
+				if fn == "" {
+					var ext string
+					if exts, err := mime.ExtensionsByType(msg.ContentType); err != nil {
+						log.Printf("Extension for %q: %v", msg.ContentType)
+					} else if len(ext) > 0 {
+						ext = exts[0]
+					}
+					fn = fmt.Sprintf("%09d%s", i, ext)
+				}
+				fn = filepath.Join(tempDir, fn)
+				log.Printf("Writing data to %q.", fn)
+				if err := ioutil.WriteFile(fn, msg.Body, 0400); err != nil {
+					msg.Nack(false, true)
+					os.Remove(fn)
+					log.Fatal(err)
+				}
+				cmd := exec.Command(args[0], append(args[1:], fn)...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				log.Printf("Calling %q", cmd.Args)
+				if err := cmd.Run(); err != nil {
+					msg.Nack(false, true)
+					os.Remove(fn)
+					log.Printf("%q: %v", cmd.Args, err)
+					continue
+				}
+				os.Remove(fn)
 				if err := msg.Ack(false); err != nil {
 					log.Printf("cannot ACK %q: %v", msg, err)
 				}
