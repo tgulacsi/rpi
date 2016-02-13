@@ -190,7 +190,12 @@ func main() {
 				i++
 				log.Printf("Received %s with %q from %s@%s.",
 					msg.MessageId, msg.Headers, msg.UserId, msg.AppId)
-				fn := filepath.Base(msg.Headers["FileName"].(string))
+				var fn string
+				if fnI := msg.Headers["FileName"]; fnI != nil {
+					if fn, _ = fnI.(string); fn != "" {
+						fn = filepath.Base(fn)
+					}
+				}
 				if fn == "" {
 					var ext string
 					if exts, err := mime.ExtensionsByType(msg.ContentType); err != nil {
