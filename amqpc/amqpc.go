@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -55,6 +56,7 @@ func main() {
 	p.StringVarP(&queue, "queue", "q", queue, "queue name to publish")
 
 	appID := queue
+	var noCompress bool
 	pubCmd := &cobra.Command{
 		Use:     "pub",
 		Aliases: []string{"publish", "send", "write"},
@@ -85,22 +87,26 @@ func main() {
 					} else if fh, err := os.Open(arg); err != nil {
 						log.Fatal(err)
 					} else {
-						pr, pw := io.Pipe()
-						go func() {
-							defer fh.Close()
-							gw := gzip.NewWriter(pw)
-							if _, err := io.Copy(gw, fh); err != nil {
-								pw.CloseWithError(err)
-								return
-							}
-							pw.CloseWithError(gw.Close())
-						}()
-						r = pr
+						if noCompress {
+							r = fh
+						} else {
+							pr, pw := io.Pipe()
+							go func() {
+								defer fh.Close()
+								gw := gzip.NewWriter(pw)
+								if _, err := io.Copy(gw, fh); err != nil {
+									pw.CloseWithError(err)
+									return
+								}
+								pw.CloseWithError(gw.Close())
+							}()
+							r = pr
+							contentEncoding = "application/gzip"
+						}
 						tbl["FileName"] = arg
 						if err := amqp.Table(tbl).Validate(); err != nil {
 							log.Fatal(err)
 						}
-						contentEncoding = "application/gzip"
 						mimeType = mime.TypeByExtension(filepath.Ext(arg))
 					}
 				} else {
@@ -157,6 +163,7 @@ func main() {
 	}
 	f := pubCmd.Flags()
 	f.StringVarP(&appID, "app-id", "", appID, "appID")
+	f.BoolVarP(&noCompress, "no-compress", "", noCompress, "disable file data compression (for slow devices)")
 
 	subCmd := &cobra.Command{
 		Use:     "sub",
@@ -194,11 +201,26 @@ func main() {
 				}
 				fn = filepath.Join(tempDir, fn)
 				log.Printf("Writing data to %q.", fn)
-				if err := ioutil.WriteFile(fn, msg.Body, 0400); err != nil {
+				r := ioutil.NopCloser(bytes.NewReader(msg.Body))
+				if msg.ContentEncoding == "application/gzip" {
+					if r, err = gzip.NewReader(r); err != nil {
+						msg.Nack(false, true)
+						log.Fatal(err)
+					}
+				}
+				fh, err := os.Create(fn)
+				if err == nil {
+					_, err = io.Copy(fh, r)
+				}
+				if closeErr := fh.Close(); closeErr != nil && err == nil {
+					err = closeErr
+				}
+				if err != nil {
 					msg.Nack(false, true)
 					os.Remove(fn)
 					log.Fatal(err)
 				}
+
 				cmd := exec.Command(args[0], append(args[1:], fn)...)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr

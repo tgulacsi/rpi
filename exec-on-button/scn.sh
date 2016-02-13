@@ -1,11 +1,11 @@
 #!/bin/sh -e
 FN=/tmp/scan-$$
 set -x
-#scanadf -d 'fujitsu:ScanSnap S510:7301' -o $FN-%04d.tiff
-scanadf -o $FN-%04d.tiff
-for nm in $FN-*.tiff; do
-	gm convert $nm $(dirname $nm)/$(basename $nm .tiff).jpg
-	rm $nm
-done
-/home/pi/bin/camput file --permanode --tag scanner $FN*.jpg
-rm -rf $FN*.jpg
+scanadf \
+	-S /home/pi/bin/scn-sane-pp.sh \
+	--source 'ADF Duplex' \
+	--mode Color \
+	--resolution 300 --y-resolution 300 \
+	-o $FN-%04d.pnm
+#/home/pi/bin/camput file --permanode --tag scanner $FN*.png
+rm -rf $FN*.png

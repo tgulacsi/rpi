@@ -1,8 +1,9 @@
 #!/bin/sh -e
-{
-set -x
-unpaper "$1" "$1".pnm
-rm "$1"
-gm convert "$1".pnm "$1".png
-rm "$1".pnm
-} 2>&1 | tee -a /var/log/scn-sane-pp/scn-sane-pp.log
+LOGFN=/var/log/scn-sane-pp/scn-sane-pp.log
+mkdir -p $(dirname $LOGFN)
+ENVFN="$0.env"
+if [ -e $ENVFN ]; then
+	# contains AMQP_USER and AMQP_PASSWORD
+	. $ENVFN
+fi
+/home/pi/bin/amqpc pub @"$1" 2>&1 | tee -a $LOGFN
