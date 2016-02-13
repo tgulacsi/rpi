@@ -165,6 +165,7 @@ func main() {
 	f.StringVarP(&appID, "app-id", "", appID, "appID")
 	f.BoolVarP(&noCompress, "no-compress", "", noCompress, "disable file data compression (for slow devices)")
 
+	var keepFiles bool
 	subCmd := &cobra.Command{
 		Use:     "sub",
 		Aliases: []string{"subscribe", "recv", "receive", "read"},
@@ -189,7 +190,7 @@ func main() {
 				i++
 				log.Printf("Received %s with %q from %s@%s.",
 					msg.MessageId, msg.Headers, msg.UserId, msg.AppId)
-				fn := msg.Headers["FileName"].(string)
+				fn := filepath.Base(msg.Headers["FileName"].(string))
 				if fn == "" {
 					var ext string
 					if exts, err := mime.ExtensionsByType(msg.ContentType); err != nil {
@@ -200,47 +201,56 @@ func main() {
 					fn = fmt.Sprintf("%09d%s", i, ext)
 				}
 				fn = filepath.Join(tempDir, fn)
-				log.Printf("Writing data to %q.", fn)
-				r := ioutil.NopCloser(bytes.NewReader(msg.Body))
-				if msg.ContentEncoding == "application/gzip" {
-					if r, err = gzip.NewReader(r); err != nil {
-						msg.Nack(false, true)
-						log.Fatal(err)
-					}
-				}
-				fh, err := os.Create(fn)
-				if err == nil {
-					_, err = io.Copy(fh, r)
-				}
-				if closeErr := fh.Close(); closeErr != nil && err == nil {
-					err = closeErr
+
+				err = receive(fn, msg, args)
+				if !keepFiles {
+					os.Remove(fn)
 				}
 				if err != nil {
 					msg.Nack(false, true)
-					os.Remove(fn)
 					log.Fatal(err)
 				}
-
-				cmd := exec.Command(args[0], append(args[1:], fn)...)
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-				log.Printf("Calling %q", cmd.Args)
-				if err := cmd.Run(); err != nil {
-					msg.Nack(false, true)
-					os.Remove(fn)
-					log.Printf("%q: %v", cmd.Args, err)
-					continue
-				}
-				os.Remove(fn)
 				if err := msg.Ack(false); err != nil {
 					log.Printf("cannot ACK %q: %v", msg, err)
 				}
 			}
 		},
 	}
+	subCmd.Flags().BoolVarP(&keepFiles, "keep-files", "x", keepFiles, "keep temporary files")
 
 	mainCmd.AddCommand(pubCmd, subCmd)
 	mainCmd.Execute()
+}
+
+func receive(fn string, msg amqp.Delivery, args []string) error {
+	log.Printf("Writing data to %q.", fn)
+	r := ioutil.NopCloser(bytes.NewReader(msg.Body))
+	var err error
+	if msg.ContentEncoding == "application/gzip" {
+		if r, err = gzip.NewReader(r); err != nil {
+			return err
+		}
+	}
+	fh, err := os.Create(fn)
+	if err == nil {
+		_, err = io.Copy(fh, r)
+	}
+	if closeErr := fh.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(args[0], append(args[1:], fn)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	log.Printf("Calling %q", cmd.Args)
+	if err := cmd.Run(); err != nil {
+		log.Printf("%q: %v", cmd.Args, err)
+		return err
+	}
+	return nil
 }
 
 var msgHandler = mqtt.MessageHandler(func(client *mqtt.Client, msg mqtt.Message) {
