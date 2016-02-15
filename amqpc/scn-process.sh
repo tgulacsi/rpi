@@ -7,15 +7,18 @@ pnm2png () {
 	optimize2bw -n -i "$fn" -o "$ofn"
 	rm "$fn"
 	fn="$ofn"
-	empty-page -i "$fn" | grep '^empty' && { rm "$fn"; exit 0; }
+	if empty-page -i "$fn" 2>&1 | grep '^empty'; then
+		rm "$fn"
+		echo 'page is empty' >&2
+	else
+		ofn="$D/$B-bw-unpapered.png"
+		nice -n 10 unpaper "$fn" "$ofn"
+		rm "$fn"
+		fn="$ofn"
 
-	ofn="$D/$B-bw-unpapered.png"
-	nice -n 10 unpaper "$fn" "$ofn"
-	rm "$fn"
-	fn="$ofn"
-
-	$HOME/bin/camput file -permanode -tag scan "$fn"
-	echo "PNG=$fn"
+		$HOME/bin/camput file -permanode -tag scan "$fn"
+		echo "PNG=$fn"
+	fi
 }
 
 echo "### $@ ###"
